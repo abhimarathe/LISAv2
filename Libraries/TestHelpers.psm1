@@ -31,6 +31,22 @@ Function New-ResultSummary($testResult, $checkValues, $testName, $metaData) {
 	return $resultString
 }
 
+$ExcludedSetupConfigsToDisplay = @("RGIdentifier","SetupScript")
+function ConvertFrom-SetupConfig([object]$SetupConfig, [switch]$WrappingLines) {
+	$resultString = ""
+	$SetupConfig.ChildNodes | Sort-Object LocalName | Foreach-Object {
+		if ($SetupConfig.($_.LocalName) -and !($ExcludedSetupConfigsToDisplay -contains $_.LocalName)) {
+			if ($WrappingLines.IsPresent) {
+				$resultString += "&nbsp;&nbsp;$($_.LocalName):$($SetupConfig.($_.LocalName))<br />"
+			}
+			else {
+				$resultString += "$($_.LocalName): $($SetupConfig.($_.LocalName)), "
+			}
+		}
+	}
+	return $resultString.Trim(", ")
+}
+
 Function Get-FinalResultHeader($resultArr) {
 	switch ($resultArr) {
 		{($_ -imatch "FAIL")} { $result = $global:ResultFail; break}
@@ -329,7 +345,7 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 	$MaskedCommand = $command
 	if ($MaskStrings) {
 		foreach ($item in $MaskStrings.Split(",")) {
-			if ($item) { $MaskedCommand = $MaskedCommand.Replace($item,'*******') }
+			if ($item) { $MaskedCommand = $MaskedCommand.Replace($item,'******') }
 		}
 	}
 	$randomFileName = [System.IO.Path]::GetRandomFileName()
@@ -361,6 +377,9 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 			$logCommand = $linuxCommand
 			$linuxCommand += "sudo -S bash -c `'bash runtest.sh ; echo AZURE-LINUX-EXIT-CODE-`$?`' `""
 			$logCommand += "sudo -S $MaskedCommand`""
+		}
+		if ($plainTextPassword) {
+			$logCommand = $logCommand.Replace($plainTextPassword, '******')
 		}
 	} else {
 		if ($detectedDistro -eq "COREOS") {
@@ -394,7 +413,8 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 				else { .\Tools\plink.exe -ssh -C -v -pw $password -P $port $username@$ip $jcommand; } `
 			} `
 			-ArgumentList $currentDir, $username, $password, $ip, $port, $linuxCommand, $sshKey
-		} else {
+		}
+		else {
 			$attemptswt += 1
 			$runLinuxCmdJob = Start-Job -ScriptBlock `
 			{ `
@@ -405,38 +425,24 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 			} `
 			-ArgumentList $currentDir, $username, $password, $ip, $port, $linuxCommand, $sshKey
 		}
-		$RunLinuxCmdOutput = ""
-		$debugOutput = ""
-		$LinuxExitCode = ""
-		if ( $RunInBackGround ) {
+		$runLinuxCmdOutput = [System.Text.StringBuilder]::new()
+		if ($RunInBackGround) {
 			While(($runLinuxCmdJob.State -eq "Running") -and ($isBackGroundProcessStarted -eq $false ) -and $notExceededTimeLimit) {
-				$SSHOut = Receive-Job $runLinuxCmdJob 2> $LogDir\$randomFileName
+				$null = Receive-Job $runLinuxCmdJob -Keep 2> $LogDir\$randomFileName
 				$jobOut = Get-Content $LogDir\$randomFileName
 				if ($jobOut) {
-					foreach($outLine in $jobOut) {
-						if ($outLine -imatch "Started a shell") {
-							$LinuxExitCode = $outLine
+					foreach ($outLine in $jobOut) {
+						if ($outLine -cmatch "^Started a shell") {
 							$isBackGroundProcessStarted = $true
 							$returnCode = 0
-						} else {
-							$RunLinuxCmdOutput += "$outLine`n"
+						}
+						else {
+							$null = $runLinuxCmdOutput.AppendLine($outLine)
 						}
 					}
 				}
-				$debugLines = Get-Content $LogDir\$randomFileName
-				if ($debugLines) {
-					$debugString = ""
-					foreach ($line in $debugLines) {
-						$debugString += $line
-					}
-					$debugOutput += "$debugString`n"
-				}
-				Write-Progress -Activity "Attempt : $attemptswot+$attemptswt : Initiating command in Background Mode : $logCommand on $ip : $port" `
-					-Status "Timeout in $($RunMaxAllowedTime - $RunElaplsedTime) seconds.." -Id 87678 `
-					-PercentComplete (($RunElaplsedTime/$RunMaxAllowedTime)*100) -CurrentOperation "SSH ACTIVITY : $debugString"
 				$RunCurrentTime = Get-Date
-				$RunDiffTime = $RunCurrentTime - $RunStartTime
-				$RunElaplsedTime =  $RunDiffTime.TotalSeconds
+				$RunElaplsedTime = ($RunCurrentTime - $RunStartTime).TotalSeconds
 				if ($RunElaplsedTime -le $RunMaxAllowedTime) {
 					$notExceededTimeLimit = $true
 				} else {
@@ -446,28 +452,19 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 				}
 			}
 			Wait-Time -seconds 2
-			$SSHOut = Receive-Job $runLinuxCmdJob 2> $LogDir\$randomFileName
-			if ($SSHOut) {
-				foreach ($outLine in $SSHOut) {
-					if ($outLine -imatch "AZURE-LINUX-EXIT-CODE-") {
-						$LinuxExitCode = $outLine
+			$jobOut = Receive-Job $runLinuxCmdJob 2> $LogDir\$randomFileName
+			if ($jobOut) {
+				foreach ($outLine in $jobOut) {
+					if ($outLine -cmatch ".*AZURE-LINUX-EXIT-CODE-") {
 						$isBackGroundProcessTerminated = $true
-					} else {
-						$RunLinuxCmdOutput += "$outLine`n"
+						$returnCode = [int]($outLine -replace ".*AZURE-LINUX-EXIT-CODE-","")
+					}
+					else {
+						$null = $runLinuxCmdOutput.AppendLine($outLine)
 					}
 				}
 			}
-
 			$debugLines = Get-Content $LogDir\$randomFileName
-			if ($debugLines) {
-				$debugString = ""
-				foreach ($line in $debugLines) {
-					$debugString += $line
-				}
-				$debugOutput += "$debugString`n"
-			}
-			Write-Progress -Activity "Attempt : $attemptswot+$attemptswt : Executing $logCommand on $ip : $port" `
-				-Status $runLinuxCmdJob.State -Id 87678 -SecondsRemaining ($RunMaxAllowedTime - $RunElaplsedTime) -Completed
 			if ( $isBackGroundProcessStarted -and !$isBackGroundProcessTerminated ) {
 				Write-LogDbg "$MaskedCommand is running in background with ID $($runLinuxCmdJob.Id) ..."
 				Add-Content -Path $LogDir\CurrentTestBackgroundJobs.txt -Value $runLinuxCmdJob.Id
@@ -477,12 +474,11 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 				if (!$isBackGroundProcessStarted) {
 					Write-LogErr "Failed to start process in background.."
 				}
-				if ( $isBackGroundProcessTerminated ) {
-					Write-LogErr "Background Process terminated from Linux side with error code :  $($LinuxExitCode.Split("-")[4])"
-					$returnCode = $($LinuxExitCode.Split("-")[4])
-					Write-LogErr $SSHOut
+				if ($isBackGroundProcessTerminated) {
+					Write-LogDbg "Background Process '$MaskedCommand' terminated from Linux side with exit code :  $returnCode"
+					Write-LogDbg ($runLinuxCmdOutput.ToString().Trim() -replace "[sudo] password for $username`: ","" -replace "Password: ","")
 				}
-				if ($debugOutput -imatch "Unable to authenticate") {
+				if ($debugLines -imatch "Unable to authenticate") {
 					Write-LogErr "Unable to authenticate. Not retrying!"
 					Throw "Calling function - $($MyInvocation.MyCommand). Unable to authenticate"
 				}
@@ -490,7 +486,6 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 					$retValue = ""
 					Throw "Calling function - $($MyInvocation.MyCommand). Timeout while executing command : $MaskedCommand"
 				}
-				Write-LogErr "Linux machine returned exit code : $($LinuxExitCode.Split("-")[4])"
 				if ($attempts -eq $maxRetryCount) {
 					Throw "Calling function - $($MyInvocation.MyCommand). Failed to execute : $MaskedCommand."
 				} else {
@@ -502,31 +497,12 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 			Remove-Item $LogDir\$randomFileName -Force | Out-Null
 		} else {
 			While($notExceededTimeLimit -and ($runLinuxCmdJob.State -eq "Running")) {
-				$jobOut = Receive-Job $runLinuxCmdJob 2> $LogDir\$randomFileName
-				if ($jobOut) {
-					$jobOut = $jobOut.Replace("[sudo] password for $username`: ","").Replace("Password: ","")
-					foreach ($outLine in $jobOut) {
-						if ($outLine -imatch "AZURE-LINUX-EXIT-CODE-") {
-							$LinuxExitCode = $outLine
-						} else {
-							$RunLinuxCmdOutput += "$outLine`n"
-						}
-					}
-				}
-				$debugLines = Get-Content $LogDir\$randomFileName
-				if ($debugLines) {
-					$debugString = ""
-					foreach ($line in $debugLines) {
-						$debugString += $line
-					}
-					$debugOutput += "$debugString`n"
-				}
+				$RunCurrentTime = Get-Date
+				$null = Receive-Job $runLinuxCmdJob -Keep
 				Write-Progress -Activity "Attempt : $attemptswot+$attemptswt : Executing $logCommand on $ip : $port" `
 					-Status "Timeout in $($RunMaxAllowedTime - $RunElaplsedTime) seconds.." -Id 87678 `
-					-PercentComplete (($RunElaplsedTime/$RunMaxAllowedTime)*100) -CurrentOperation "SSH ACTIVITY : $debugString"
-				$RunCurrentTime = Get-Date
-				$RunDiffTime = $RunCurrentTime - $RunStartTime
-				$RunElaplsedTime =  $RunDiffTime.TotalSeconds
+					-PercentComplete (($RunElaplsedTime/$RunMaxAllowedTime)*100) -CurrentOperation $RunCurrentTime
+				$RunElaplsedTime = ($RunCurrentTime - $RunStartTime).TotalSeconds
 				if ($RunElaplsedTime -le $RunMaxAllowedTime) {
 					$notExceededTimeLimit = $true
 				} else {
@@ -537,51 +513,39 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 			}
 			$jobOut = Receive-Job $runLinuxCmdJob 2> $LogDir\$randomFileName
 			if ($jobOut) {
-				$jobOut = $jobOut.Replace("[sudo] password for $username`: ","").Replace("Password: ","")
 				foreach ($outLine in $jobOut) {
-					if ($outLine -imatch "AZURE-LINUX-EXIT-CODE-") {
-						$LinuxExitCode = $outLine
-					} else {
-						$RunLinuxCmdOutput += "$outLine`n"
+					if ($outLine -cmatch ".*AZURE-LINUX-EXIT-CODE-") {
+						$returnCode = [int]($outLine -replace ".*AZURE-LINUX-EXIT-CODE-","")
+					}
+					else {
+						$null = $runLinuxCmdOutput.AppendLine($outLine)
 					}
 				}
 			}
 			$debugLines = Get-Content $LogDir\$randomFileName
-			if ($debugLines) {
-				$debugString = ""
-				foreach ($line in $debugLines) {
-					$debugString += $line
-				}
-				$debugOutput += "$debugString`n"
-			}
 			Write-Progress -Activity "Attempt : $attemptswot+$attemptswt : Executing $logCommand on $ip : $port" `
 				-Status $runLinuxCmdJob.State -Id 87678 -SecondsRemaining ($RunMaxAllowedTime - $RunElaplsedTime) -Completed
 			Remove-Job $runLinuxCmdJob
 			Remove-Item $LogDir\$randomFileName -Force | Out-Null
-			if ($LinuxExitCode -imatch "AZURE-LINUX-EXIT-CODE-0") {
-				$returnCode = 0
+			if ($returnCode -eq 0) {
 				Write-LogDbg "$MaskedCommand executed successfully in $([math]::Round($RunElaplsedTime,2)) seconds." `
 					-WriteHostOnly $WriteHostOnly -NoLogsPlease $NoLogsPlease
-				$retValue = $RunLinuxCmdOutput.Trim()
+				# Trim() is necessary here for the $retValue, as other utilities rely on the Trim() to remove the blank strings and the last `n
+				$retValue = $runLinuxCmdOutput.ToString().Trim() -replace "[sudo] password for $username`: ","" -replace "Password: ",""
 			} else {
 				if (!$ignoreLinuxExitCode) {
-					$debugOutput = ($debugOutput.Split("`n")).Trim()
-					foreach ($line in $debugOutput) {
-						if ($line) {
-							Write-LogErr $line
-						}
-					}
+					Write-LogErr ($debugLines -join '')
 				}
-				if ($debugOutput -imatch "Unable to authenticate") {
-						Write-LogWarn "Unable to authenticate. Not retrying!"
-						Throw "Calling function - $($MyInvocation.MyCommand). Unable to authenticate"
-					}
+				if ($debugLines -imatch "Unable to authenticate") {
+					Write-LogWarn "Unable to authenticate. Not retrying!"
+					Throw "Calling function - $($MyInvocation.MyCommand). Unable to authenticate"
+				}
 				if (!$ignoreLinuxExitCode) {
 					if ($timeOut) {
 						$retValue = ""
 						Throw "Calling function - $($MyInvocation.MyCommand). Timeout while executing command : $MaskedCommand"
 					}
-					Write-LogErr "Linux machine returned exit code : $($LinuxExitCode.Split("-")[4])"
+					Write-LogErr "Linux machine returned exit code : $returnCode"
 					if ($attemptswt -eq $maxRetryCount -and $attemptswot -eq $maxRetryCount) {
 						Throw "Calling function - $($MyInvocation.MyCommand). Failed to execute : $MaskedCommand."
 					} else {
@@ -590,8 +554,8 @@ Function Run-LinuxCmd([string] $username, [string] $password, [string] $ip, [str
 						}
 					}
 				} else {
-					Write-LogDbg "Command execution returned return code $($LinuxExitCode.Split("-")[4]) Ignoring.."
-					$retValue = $RunLinuxCmdOutput.Trim()
+					Write-LogDbg "Command execution returned return code $returnCode Ignoring.."
+					$retValue = $runLinuxCmdOutput.ToString() -replace "[sudo] password for $username`: ","" -replace "Password: ",""
 					break
 				}
 			}

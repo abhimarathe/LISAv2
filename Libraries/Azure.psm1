@@ -128,7 +128,7 @@ Function Assert-DeploymentLimitation($RGXMLData, [ref]$TargetLocation, $Override
 			$testVMSize = $OverrideVMSize
 		}
 		else {
-			$testVMSize = $VM.ARMInstanceSize
+			$testVMSize = $VM.InstanceSize
 		}
 
 		if (!$AllTestVMSizes.$testVMSize) {
@@ -199,7 +199,7 @@ Function Assert-DeploymentLimitation($RGXMLData, [ref]$TargetLocation, $Override
 	$RGLimit = 980
 	$currentRGCount = (Get-AzResourceGroup).Count
 	$overFlowErrors += Test-OverflowErrors -ResourceType "Resource Group" -CurrentValue $currentRGCount `
-		-RequiredValue 1 -MaximumLimit $RGLimit -Location $vmAvailableLocations[$index]
+		-RequiredValue 1 -MaximumLimit $RGLimit -Location $TargetLocation.Value
 
 	if ($overFlowErrors -eq 0) {
 		Write-LogInfo "Estimated subscription usage is under allowed limits."
@@ -230,7 +230,7 @@ Function Get-StorageAccountFromRegion($Region, $StorageAccount) {
 	return $StorageAccountName
 }
 
-Function Update-StorageAccountType($TestCaseData, [string]$Location, $GlobalConfig, $OsVHD) {
+Function Update-StorageAccountType($CurrentTestData, [string]$Location, $GlobalConfig, $OsVHD) {
 	$RegionAndStorageMapFile = "$PSScriptRoot\..\XML\RegionAndStorageAccounts.xml"
 	if (Test-Path $RegionAndStorageMapFile) {
 		$RegionAndStorageMap = [xml](Get-Content $RegionAndStorageMapFile)
@@ -242,7 +242,7 @@ Function Update-StorageAccountType($TestCaseData, [string]$Location, $GlobalConf
 	# Set '$global:GlobalConfig' ARMStorageAccount, in case Test Scripts from Test Case using the '$global:GlobalConfig.Global.Azure.Subscription.ARMStorageAccount' directly
 	$global:GlobalConfig.Global.Azure.Subscription.ARMStorageAccount = $currentStorageAccount
 	$resultStorageAccount = $currentStorageAccount
-	if ($TestCaseData.AdditionalHWConfig.StorageAccountType -and $TestCaseData.AdditionalHWConfig.StorageAccountType.Contains("Premium")) {
+	if ($CurrentTestData.SetupConfig.StorageAccountType -and $CurrentTestData.SetupConfig.StorageAccountType.Contains("Premium")) {
 		$storageAccountType = (Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $currentStorageAccount }).Sku.Tier.ToString()
 		if ($storageAccountType -inotmatch "premium") {
 			$existingStandardStorageAccount = Get-StorageAccountFromRegion -Region $Location -StorageAccount "ExistingStorage_Standard"
@@ -268,8 +268,8 @@ Function Update-StorageAccountType($TestCaseData, [string]$Location, $GlobalConf
 			}
 			else {
 				# if $currentStorageAccount's StorageType is Standard_LRS, but not from existing standard storage accounts, then throw exception with messages
-				Write-LogErr "Provided storage account is not premium type, this case $($TestCaseData.testName) need run under premium type of storage account."
-				Throw "Case $($TestCaseData.testName) need run under premium type of storage account."
+				Write-LogErr "Provided storage account is not premium type, this case $($CurrentTestData.testName) need run under premium type of storage account."
+				Throw "Case $($CurrentTestData.testName) need run under premium type of storage account."
 			}
 		}
 	}
@@ -311,7 +311,8 @@ Function PrepareAutoCompleteStorageAccounts ($storageAccountsRGName, $XMLSecretF
 		)
 		if ($RSAMapping -and (Test-Path $AzureSecretFile)) {
 			$AzureSecretXml = [xml](Get-Content $AzureSecretFile)
-			$outDatedNodes = $AzureSecretXml.SelectNodes('/secrets/RegionAndStorageAccounts')
+			# avoid case sensitive
+			$outDatedNodes = @($AzureSecretXml.secrets.RegionAndStorageAccounts)
 			if ($outDatedNodes) {
 				$outDatedNodes | ForEach-Object { $AzureSecretXml.secrets.RemoveChild($_)  | Out-Null }
 			}
@@ -393,13 +394,13 @@ Function PrepareAutoCompleteStorageAccounts ($storageAccountsRGName, $XMLSecretF
 	}
 }
 
-Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Distro, [string]$TestLocation, $GlobalConfig, $TiPSessionId, $TipCluster, $UseExistingRG, $ResourceCleanup, $PlatformFaultDomainCount, $PlatformUpdateDomainCount, [boolean]$EnableNSG = $false) {
-	Function GenerateAzDeploymentJSONFile ($RGName, $ImageName, $osVHD, $RGXMLData, $Location, $azuredeployJSONFilePath, $CurrentTestData, $StorageAccountName) {
+Function Invoke-AllResourceGroupDeployments($SetupTypeData, $CurrentTestData, $RGIdentifier, [string]$TestLocation, $GlobalConfig, $TiPSessionId, $TipCluster, $UseExistingRG, $ResourceCleanup, $PlatformFaultDomainCount, $PlatformUpdateDomainCount, [boolean]$EnableNSG = $false) {
+	Function GenerateAzDeploymentJSONFile ($RGName, $ImageName, $osVHD, $RGXMLData, $Location, $azuredeployJSONFilePath, $StorageAccountName) {
 		#Random Data
 		$RGrandomWord = ([System.IO.Path]::GetRandomFileName() -replace '[^a-z]')
 		$RGRandomNumber = Get-Random -Minimum 11111 -Maximum 99999
 
-		$UseManagedDisks = $CurrentTestData.AdditionalHWConfig.DiskType -inotcontains "unmanaged"
+		$UseManagedDisks = $CurrentTestData.SetupConfig.DiskType -inotcontains "unmanaged"
 		if ($UseManagedDisks) {
 			$DiskType = "Managed"
 		}
@@ -407,15 +408,15 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 			$DiskType = "Unmanaged"
 		}
 
-		$UseSpecializedImage = $CurrentTestData.AdditionalHWConfig.ImageType -contains "Specialized"
-		$IsWindowsOS = $CurrentTestData.AdditionalHWConfig.OSType -contains "Windows"
+		$UseSpecializedImage = $CurrentTestData.SetupConfig.ImageType -contains "Specialized"
+		$IsWindowsOS = $CurrentTestData.SetupConfig.OSType -contains "Windows"
 		if ($IsWindowsOS) {
 			$OSType = "Windows"
 		}
 		else {
 			$OSType = "Linux"
 		}
-		if ( $CurrentTestData.AdditionalHWConfig.OSDiskType -eq "Ephemeral" ) {
+		if ( $CurrentTestData.SetupConfig.OSDiskType -eq "Ephemeral" ) {
 			if ( $UseManagedDisks ) {
 				$UseEphemeralOSDisk = $true
 				$DiskType += "-Ephemeral"
@@ -765,7 +766,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 			Add-Content -Value "$($indents[5])}" -Path $jsonFile
 
 			Add-Content -Value "$($indents[4])}" -Path $jsonFile
-			if ($VMGeneration -eq "2") {
+			if ($CurrentTestData.SetupConfig.VMGeneration -eq "2") {
 				Add-Content -Value "$($indents[4]),^hyperVGeneration^: ^V2^" -Path $jsonFile
 			}
 			else {
@@ -1094,11 +1095,11 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 		$vmAdded = $false
 		$role = 0
 		foreach ( $newVM in $RGXMLData.VirtualMachine) {
-			if ( $CurrentTestData.OverrideVMSize) {
-				$instanceSize = $CurrentTestData.OverrideVMSize
+			if ( $CurrentTestData.SetupConfig.OverrideVMSize) {
+				$instanceSize = $CurrentTestData.SetupConfig.OverrideVMSize
 			}
 			else {
-				$instanceSize = $newVM.ARMInstanceSize
+				$instanceSize = $newVM.InstanceSize
 			}
 
 			$ExistingSubnet = $newVM.ARMSubnetName
@@ -1201,7 +1202,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 			}
 			#endregion
 			Add-Content -Value "$($indents[4])]" -Path $jsonFile
-			if ($CurrentTestData.AdditionalHWConfig.Networking -imatch "SRIOV") {
+			if ($CurrentTestData.SetupConfig.Networking -imatch "SRIOV") {
 				Add-Content -Value "$($indents[4])," -Path $jsonFile
 				Add-Content -Value "$($indents[4])^enableAcceleratedNetworking^: true" -Path $jsonFile
 				Write-LogInfo "Enabled Accelerated Networking."
@@ -1243,7 +1244,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 				Add-Content -Value "$($indents[6])}" -Path $jsonFile
 				Add-Content -Value "$($indents[5])}" -Path $jsonFile
 				Add-Content -Value "$($indents[4])]" -Path $jsonFile
-				if ($CurrentTestData.AdditionalHWConfig.Networking -imatch "SRIOV") {
+				if ($CurrentTestData.SetupConfig.Networking -imatch "SRIOV") {
 					Add-Content -Value "$($indents[4])," -Path $jsonFile
 					Add-Content -Value "$($indents[4])^enableAcceleratedNetworking^: true" -Path $jsonFile
 					Write-LogInfo "Enabled Accelerated Networking for $NicName."
@@ -1286,7 +1287,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 				Add-Content -Value "$($indents[6])}" -Path $jsonFile
 				Add-Content -Value "$($indents[5])}" -Path $jsonFile
 				Add-Content -Value "$($indents[4])]" -Path $jsonFile
-				if ($CurrentTestData.AdditionalHWConfig.Networking -imatch "SRIOV") {
+				if ($CurrentTestData.SetupConfig.Networking -imatch "SRIOV") {
 					Add-Content -Value "$($indents[4])," -Path $jsonFile
 					Add-Content -Value "$($indents[4])^enableAcceleratedNetworking^: true" -Path $jsonFile
 					Write-LogInfo "  Enabled Accelerated Networking for $NicName."
@@ -1603,12 +1604,13 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 	Write-LogInfo "Current test setup: $($SetupTypeData.Name)"
 
 	$OsVHD = $global:BaseOSVHD
-	$osImage = $global:ARMImageName
-	if ($TestCaseData.AdditionalHWConfig.TestLocation) {
-		$location = $TestCaseData.AdditionalHWConfig.TestLocation
+	$osImage = $CurrentTestData.SetupConfig.ARMImageName
+	if ($CurrentTestData.SetupConfig.TestLocation) {
+		$location = $CurrentTestData.SetupConfig.TestLocation
 	}
 	else {
 		$location = $TestLocation
+		Write-LogInfo "'TestLocation' of: '$($CurrentTestData.TestName)' is not set from Test Xml Definition or from LISAv2 Parameter '-TestLocation'.`nLISAv2 will auto select an available TestLocation/(Region) with current subscription"
 	}
 
 	$patternOfResourceNamePrefix = ($SetupTypeData.ResourceGroup | Select-Object -ExpandProperty "VirtualMachine" `
@@ -1619,7 +1621,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 		$readyToDeploy = $false
 		$coreCountExceededTimeout = 3600
 		while (!$readyToDeploy) {
-			$readyToDeploy = Assert-DeploymentLimitation -RGXMLData $RG -TargetLocation ([ref]$location) -OverrideVMSize $TestCaseData.OverrideVMSize
+			$readyToDeploy = Assert-DeploymentLimitation -RGXMLData $RG -TargetLocation ([ref]$location) -OverrideVMSize $CurrentTestData.SetupConfig.OverrideVMSize
 			$validateCurrentTime = Get-Date
 			$elapsedWaitTime = ($validateCurrentTime - $validateStartTime).TotalSeconds
 			# Don't wait if -UseExistingRG, otherwise waiting for resource cleanup to release quota
@@ -1635,12 +1637,14 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 		}
 		if ($readyToDeploy) {
 			# After Assert-DeploymentLimitation, '$location' may be changed and selected by LISAv2
-			$updatedStorageAccount = Update-StorageAccountType -Location $location -TestCaseData $TestCaseData -GlobalConfig $GlobalConfig -OsVHD $OsVHD
-
+			$updatedStorageAccount = Update-StorageAccountType -Location $location -CurrentTestData $CurrentTestData -GlobalConfig $GlobalConfig -OsVHD $OsVHD
+			if (!$CurrentTestData.SetupConfig.TestLocation) {
+				$CurrentTestData.SetupConfig.InnerXml += "<TestLocation>$location</TestLocation>"
+			}
 			$uniqueId = New-TimeBasedUniqueId
 			$isResourceGroupDeploymentCompleted = "False"
 			$retryDeployment = 0
-			$groupName = "LISAv2-" + $SetupTypeData.Name + "-" + $Distro + "-" + "$TestID-" + "$uniqueId"
+			$groupName = "LISAv2-" + $SetupTypeData.Name + "-" + $RGIdentifier + "-" + "$TestID-" + "$uniqueId"
 
 			if ($SetupTypeData.ResourceGroup.Count -gt 1) {
 				$groupName = $groupName + "-" + $resourceGroupCount
@@ -1649,7 +1653,7 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 				if ($UseExistingRG) {
 					$isResourceGroupCreated = "True"
 					$isRGDeleted = $true
-					$groupName = $Distro
+					$groupName = $RGIdentifier
 				}
 				else {
 					Write-LogInfo "Creating Resource Group : $groupName."
@@ -1658,13 +1662,13 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 				}
 				if ($isRGDeleted) {
 					if (!$UseExistingRG) {
-						$isResourceGroupCreated = Create-ResourceGroup -RGName $groupName -location $location -CurrentTestData $TestCaseData
+						$isResourceGroupCreated = Create-ResourceGroup -RGName $groupName -location $location -CurrentTestData $CurrentTestData
 					}
 					Write-LogInfo "test platform is : $testPlatform"
 					if ($isResourceGroupCreated -eq "True") {
 						$azureDeployJSONFilePath = Join-Path $env:TEMP "$groupName.json"
 						$null = GenerateAzDeploymentJSONFile -RGName $groupName -ImageName $osImage -osVHD $osVHD -RGXMLData $RG -Location $location `
-							-azuredeployJSONFilePath $azureDeployJSONFilePath -CurrentTestData $TestCaseData -StorageAccountName $updatedStorageAccount
+							-azuredeployJSONFilePath $azureDeployJSONFilePath -StorageAccountName $updatedStorageAccount
 
 						$DeploymentStartTime = (Get-Date)
 						$CreateRGDeployments = Invoke-ResourceGroupDeployment -RGName $groupName -TemplateFile $azureDeployJSONFilePath `
@@ -1673,9 +1677,6 @@ Function Invoke-AllResourceGroupDeployments($SetupTypeData, $TestCaseData, $Dist
 						$DeploymentEndTime = (Get-Date)
 						$DeploymentElapsedTime = $DeploymentEndTime - $DeploymentStartTime
 						if ( $CreateRGDeployments.Status ) {
-							# After Resource Group deployment completed successfully, set global:TestLocation with selected Region/TestLocation
-							# Get rid of potential risk that Test Scripts from Test Cases using the global '$TestLocation' arbitrarily
-							Set-Variable -Name TestLocation -Value $location -Scope Global -Force
 							$retValue = "True"
 							$isResourceGroupDeploymentCompleted = "True"
 							$resourceGroupCount = $resourceGroupCount + 1
@@ -2100,7 +2101,7 @@ Function Get-AllDeploymentData([string]$ResourceGroups, [string]$PatternOfResour
 		Add-Member -InputObject $objNode -MemberType NoteProperty -Name URLv6 -Value $URL -Force
 		Add-Member -InputObject $objNode -MemberType NoteProperty -Name Status -Value $Status -Force
 		Add-Member -InputObject $objNode -MemberType NoteProperty -Name InstanceSize -Value $InstanceSize -Force
-		Add-Member -InputObject $objNode -MemberType NoteProperty -Name VMGeneration -Value $VMGeneration -Force
+		#Add-Member -InputObject $objNode -MemberType NoteProperty -Name VMGeneration -Value $VMGeneration -Force
 		return $objNode
 	}
 
@@ -3055,7 +3056,7 @@ Function Upload-AzureBootAndDeploymentDataToDB ($DeploymentTime, $AllVMData, $Cu
 			#region KernelVersion checking
 			$KernelVersion = Get-Content "$LogDir\$($vmData.RoleName)-kernelVersion.txt"
 			#endregion
-			$SQLQuery += "('$DateTimeUTC','$global:TestPlatform','$global:TestLocation','$TestCaseName','$SubscriptionID','$SubscriptionName','$ResourceGroupName','$NumberOfVMsInRG','$RoleName',$DeploymentTime,$KernelBootTime,$WALAProvisionTime,'$HostVersion','$GuestDistro','$KernelVersion','$LISVersion','$WALAVersion','$RoleSize','$StorageType','$CallTraces','$kernelLogFile','$WALAlogFile'),"
+			$SQLQuery += "('$DateTimeUTC','$global:TestPlatform','$($CurrentTestData.SetupConfig.TestLocation)','$TestCaseName','$SubscriptionID','$SubscriptionName','$ResourceGroupName','$NumberOfVMsInRG','$RoleName',$DeploymentTime,$KernelBootTime,$WALAProvisionTime,'$HostVersion','$GuestDistro','$KernelVersion','$LISVersion','$WALAVersion','$RoleSize','$StorageType','$CallTraces','$kernelLogFile','$WALAlogFile'),"
 		}
 		$SQLQuery = $SQLQuery.TrimEnd(',')
 

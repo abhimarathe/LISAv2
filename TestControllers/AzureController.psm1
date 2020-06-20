@@ -38,8 +38,17 @@ Class AzureController : TestController
 	}
 
 	[void] ParseAndValidateParameters([Hashtable]$ParamTable) {
-		$this.ARMImageName = $ParamTable["ARMImageName"]
-
+		$parameterErrors = ([TestController]$this).ParseAndValidateParameters($ParamTable)
+		$ValidateARMImageName = {
+			$ArmImagesToBeUsed = @($this.ARMImageName.Trim(", ").Split(',').Trim())
+			if ($ArmImagesToBeUsed | Where-Object {$_.Split(" ").Count -ne 4}) {
+				$parameterErrors += ("Invalid value for the provided ARMImageName parameter: <'$($this.ARMImageName)'>." + `
+									 "The ARM image should be in the format: '<Publisher> <Offer> <Sku> <Version>,<Publisher> <Offer> <Sku> <Version>,...'")
+			}
+			else {
+				$this.AppendCustomParameters("ARMImageName", $this.ARMImageName)
+			}
+		}
 		if ($ParamTable["StorageAccount"] -imatch "^NewStorage_") {
 			Throw "LISAv2 only supports specified storage account by '-StorageAccount' or candidate parameters values as below. `n
 			Please use '-StorageAccount ""Auto_Complete_RG=XXXResourceGroupName""' or `n
@@ -50,7 +59,33 @@ Class AzureController : TestController
 			$this.StorageAccount = $ParamTable["StorageAccount"]
 		}
 
-		$parameterErrors = ([TestController]$this).ParseAndValidateParameters($ParamTable)
+		$this.ARMImageName = $ParamTable["ARMImageName"]
+		# Validate -ARMImageName and -OsVHD
+		# when both OsVHD and ARMImageName exist, parameterErrors += "..."
+		if ($this.OsVHD -and $this.ARMImageName) {
+			$parameterErrors += "'-OsVHD' could not coexist with '-ARMImageName' when testing against 'Azure' Platform."
+		}
+		elseif ($this.OsVHD) {
+			if ($this.OsVHD -and [System.IO.Path]::GetExtension($this.OsVHD) -ne ".vhd" -and !$this.OsVHD.Contains("vhd")) {
+				$parameterErrors += "-OsVHD $($this.OsVHD) does not have .vhd extension required by Platform Azure."
+			}
+		}
+		elseif (!$this.ARMImageName) {
+			# Both $this.OsVHD and $this.ARMImageName are empty, try to load <DefaultARMImageName> from .\XML\GlobalConfigurations.xml
+			if (!$this.ARMImageName -and $this.GlobalConfig) {
+				# $this.GlobalConfig has been set by base ([TestController]$this).ParseAndValidateParameters() at the beginning of this overwritten function
+				$this.ARMImageName = $this.GlobalConfig.Global.Azure.DefaultARMImageName
+				if (!$this.ARMImageName) {
+					$parameterErrors += "-OsVHD <'VHD_Name.vhd'>, or -ARMImageName '<Publisher> <Offer> <Sku> <Version>,<Publisher> <Offer> <Sku> <Version>,...', or <DefaultARMImageName> from .\XML\GlobalConfigurations.xml if required."
+				}
+				else {
+					&$ValidateARMImageName
+				}
+			}
+		}
+		elseif ($this.ARMImageName) {
+			&$ValidateARMImageName
+		}
 
 		$this.TestProvider.TipSessionId = $this.CustomParams["TipSessionId"]
 		$this.TestProvider.TipCluster = $this.CustomParams["TipCluster"]
@@ -60,21 +95,10 @@ Class AzureController : TestController
 		if ($this.CustomParams["EnableNSG"] -and $this.CustomParams["EnableNSG"] -eq "true") {
 			$this.TestProvider.EnableNSG = $true
 		}
-		if ( !$this.ARMImageName -and !$this.OsVHD ) {
-			$parameterErrors += "-ARMImageName '<Publisher> <Offer> <Sku> <Version>', or -OsVHD <'VHD_Name.vhd'> is required."
-		}
-		if (!$this.OsVHD) {
-			if (($this.ARMImageName.Trim().Split(" ").Count -ne 4) -and ($this.ARMImageName -ne "")) {
-				$parameterErrors += ("Invalid value for the provided ARMImageName parameter: <'$($this.ARMImageName)'>." + `
-									 "The ARM image should be in the format: '<Publisher> <Offer> <Sku> <Version>'.")
-			}
-		}
-		if (!$this.ARMImageName) {
-			if ($this.OsVHD -and [System.IO.Path]::GetExtension($this.OsVHD) -ne ".vhd" -and !$this.OsVHD.Contains("vhd")) {
-				$parameterErrors += "-OsVHD $($this.OsVHD) does not have .vhd extension required by Platform Azure."
-			}
-		}
 
+		if (!$this.RGIdentifier) {
+			$parameterErrors += "-RGIdentifier is not set"
+		}
 		if ($parameterErrors.Count -gt 0) {
 			$parameterErrors | ForEach-Object { Write-LogErr $_ }
 			throw "Failed to validate the test parameters provided. Please fix above issues and retry."
@@ -184,13 +208,6 @@ Class AzureController : TestController
 		$this.SetGlobalVariables()
 	}
 
-	[void] SetGlobalVariables() {
-		([TestController]$this).SetGlobalVariables()
-
-		# Used in CAPTURE-VHD-BEFORE-TEST.ps1 and some cases
-		Set-Variable -Name ARMImageName -Value $this.ARMImageName -Scope Global -Force
-	}
-
 	[void] PrepareTestImage() {
 		#If Base OS VHD is present in another storage account, then copy to test storage account first.
 		if ($this.OsVHD) {
@@ -244,8 +261,74 @@ Class AzureController : TestController
 		}
 	}
 
+	[void] PrepareSetupTypeToTestCases([hashtable]$SetupTypeToTestCases, [object[]]$AllTests) {
+		if (!$global:AllTestVMSizes) {
+			Set-Variable -Name AllTestVMSizes -Value @{} -Option ReadOnly -Scope Global
+		}
+		# Inject Networking=SRIOV/Synthetic, DiskType=Managed, OverrideVMSize to test case data
+		if (("sriov", "synthetic") -contains $this.CustomParams["Networking"]) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "Networking" -ConfigValue $this.CustomParams["Networking"] -Force $this.ForceCustom
+		}
+		if (("managed", "unmanaged") -contains $this.CustomParams["DiskType"]) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "DiskType" -ConfigValue $this.CustomParams["DiskType"] -Force $this.ForceCustom
+		}
+		if (("Specialized", "Generalized") -contains $this.CustomParams["ImageType"]) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "ImageType" -ConfigValue $this.CustomParams["ImageType"] -Force $this.ForceCustom
+		}
+		if (("Windows", "Linux") -contains $this.CustomParams["OSType"]) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "OSType" -ConfigValue $this.CustomParams["OSType"] -Force $this.ForceCustom
+		}
+		if (("1", "2") -contains $this.CustomParams["VMGeneration"]) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "VMGeneration" -ConfigValue $this.CustomParams["VMGeneration"] -Force $this.ForceCustom
+		}
+		if (@($this.CustomParams["RGIdentifier"].Split(",")).Count -eq 1) {
+			Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "RGIdentifier" -ConfigValue $this.CustomParams["RGIdentifier"] -Force $this.ForceCustom
+		}
+		else {
+			Write-LogErr "'RGIdentifier' could only be applied with multiple values, must not contain ',' in RGIdentifier value"
+		}
+		# Multiple TestLocations (parameter '-TestLocation' with value like 'eastus,westus') means to deploy from different Regions,
+		# so spliting with default Splitby (','), and apply multi single ConfigValues to $AllTests one by one.
+		Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "TestLocation" -ConfigValue $this.CustomParams["TestLocation"] -Force $this.ForceCustom
+
+		Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "OverrideVMSize" -ConfigValue $this.CustomParams["OverrideVMSize"] -Force $this.ForceCustom
+		Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "OsVHD" -ConfigValue $this.CustomParams["OsVHD"] -Force $this.ForceCustom
+		Add-SetupConfig -AllTests ([ref]$AllTests) -ConfigName "ARMImageName" -ConfigValue $this.CustomParams["ARMImageName"] -Force $this.ForceCustom
+
+		foreach ($test in $AllTests) {
+			# Put test case to hashtable, per setupType,OverrideVMSize,networking,diskType,osDiskType,switchName
+			$key = "$($test.SetupConfig.SetupType),$($test.SetupConfig.OverrideVMSize),$($test.SetupConfig.Networking),$($test.SetupConfig.DiskType)," +
+				"$($test.SetupConfig.OSDiskType),$($test.SetupConfig.SwitchName),$($test.SetupConfig.ImageType)," +
+				"$($test.SetupConfig.OSType),$($test.SetupConfig.StorageAccountType),$($test.SetupConfig.TestLocation)," +
+				"$($test.SetupConfig.ARMImageName),$($test.SetupConfig.OsVHD),$($test.SetupConfig.VMGeneration)"
+			if ($test.SetupConfig.SetupType) {
+				if ($SetupTypeToTestCases.ContainsKey($key)) {
+					$SetupTypeToTestCases[$key] += $test
+				} else {
+					$SetupTypeToTestCases.Add($key, @($test))
+				}
+			}
+		}
+
+		$AllTests.SetupConfig.OverrideVMSize | Sort-Object -Unique | Foreach-Object {
+			if (!($global:AllTestVMSizes.$_)) { $global:AllTestVMSizes["$_"] = @{} }
+		}
+		$this.TotalCaseNum = @($AllTests).Count * $this.TestIterations
+	}
+
 	[void] LoadTestCases($WorkingDirectory, $CustomTestParameters) {
 		([TestController]$this).LoadTestCases($WorkingDirectory, $CustomTestParameters)
+
+		$SetupTypeXMLs = Get-ChildItem -Path "$WorkingDirectory\XML\VMConfigurations\*.xml"
+		foreach ($file in $SetupTypeXMLs.FullName) {
+			$setupXml = [xml]( Get-Content -Path $file)
+			foreach ($SetupType in $setupXml.TestSetup.ChildNodes) {
+				$vmSizes = $SetupType.ResourceGroup.VirtualMachine.InstanceSize | Sort-Object -Unique
+				$vmSizes | ForEach-Object {
+					if (!$global:AllTestVMSizes."$_") { $global:AllTestVMSizes["$_"] = @{} }
+				}
+			}
+		}
 
 		Measure-SubscriptionCapabilities
 	}
